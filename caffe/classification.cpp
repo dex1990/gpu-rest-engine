@@ -1,15 +1,19 @@
 #include "classification.h"
-
 #include <iosfwd>
 #include <vector>
-
+#include <sys/time.h>
+#include <iostream>
+#include <fstream>
+#include <string>
+#include <algorithm>
+#include <math.h>
 #define USE_CUDNN 1
 #include <caffe/caffe.hpp>
 #include <opencv2/cudaarithm.hpp>
 #include <opencv2/cudaimgproc.hpp>
 #include <opencv2/cudawarping.hpp>
 #include <opencv2/highgui/highgui.hpp>
-
+#include <cuda_runtime.h>
 #include "common.h"
 #include "gpu_allocator.h"
 
@@ -17,7 +21,6 @@ using namespace caffe;
 using std::string;
 using GpuMat = cv::cuda::GpuMat;
 using namespace cv;
-
 /* Pair (label, confidence) representing a prediction. */
 typedef std::pair<string, float> Prediction;
 
@@ -29,36 +32,41 @@ public:
     Classifier(const string& model_file,
                const string& trained_file,
                const string& mean_file,
-               const string& label_file,
-               GPUAllocator* allocator);
+               const string& label_file);
 
-    std::vector<Prediction> Classify(const Mat& img, int N = 5);
+    std::vector<std::vector<Prediction> > Classify(const Mat& img, int N = 5);
+    
+    ~Classifier()
+    {
+       cudaStreamDestroy(stream_);
+    }
+
+    cudaStream_t CUDAStream()
+    {
+        return stream_;
+    }
 
 private:
-    void SetMean(const string& mean_file);
 
-    std::vector<float> Predict(const Mat& img);
+    std::vector<std::vector<float> > PredictCuda(const Mat& img);    
 
-    void WrapInputLayer(std::vector<GpuMat>* input_channels);
+    void WarmUp();
 
-    void Preprocess(const Mat& img,
-                    std::vector<GpuMat>* input_channels);
-
+    void Preprocess(const Mat& img,std::vector<GpuMat>* input_channels);
+   
 private:
-    GPUAllocator* allocator_;
     std::shared_ptr<Net<float>> net_;
     Size input_geometry_;
     int num_channels_;
     GpuMat mean_;
     std::vector<string> labels_;
+    cudaStream_t stream_;
 };
 
 Classifier::Classifier(const string& model_file,
                        const string& trained_file,
                        const string& mean_file,
-                       const string& label_file,
-                       GPUAllocator* allocator)
-    : allocator_(allocator)
+                       const string& label_file)
 {
     Caffe::set_mode(Caffe::GPU);
 
@@ -75,174 +83,92 @@ Classifier::Classifier(const string& model_file,
         << "Input layer should have 1 or 3 channels.";
     input_geometry_ = Size(input_layer->width(), input_layer->height());
 
-    /* Load the binaryproto mean file. */
-    SetMean(mean_file);
-
     /* Load labels. */
     std::ifstream labels(label_file.c_str());
     CHECK(labels) << "Unable to open labels file " << label_file;
     string line;
     while (std::getline(labels, line))
         labels_.push_back(string(line));
-
+    
     Blob<float>* output_layer = net_->output_blobs()[0];
     CHECK_EQ(labels_.size(), output_layer->channels())
         << "Number of labels is different from the output layer dimension.";
+    cudaStreamCreate(&stream_);
+//    printf("stream in Classifier %d\n",stream_);
+    WarmUp();
+    
 }
 
-static bool PairCompare(const std::pair<float, int>& lhs,
-                        const std::pair<float, int>& rhs)
-{
-    return lhs.first > rhs.first;
-}
-
-/* Return the indices of the top N values of vector v. */
-static std::vector<int> Argmax(const std::vector<float>& v, int N)
-{
-    std::vector<std::pair<float, int>> pairs;
-    for (size_t i = 0; i < v.size(); ++i)
-        pairs.push_back(std::make_pair(v[i], i));
-    std::partial_sort(pairs.begin(), pairs.begin() + N, pairs.end(), PairCompare);
-
-    std::vector<int> result;
-    for (int i = 0; i < N; ++i)
-        result.push_back(pairs[i].second);
-    return result;
-}
-
+extern "C" int Cudacvt(float *c,unsigned char *a, int w, int h, int tile_w, int tile_h, int idx,cudaStream_t stream);
 /* Return the top N predictions. */
-std::vector<Prediction> Classifier::Classify(const Mat& img, int N)
-{
-    std::vector<float> output = Predict(img);
-
+std::vector<std::vector<Prediction> > Classifier::Classify(const Mat& img, int N)
+{   
+    std::vector<std::vector<float> > outputs = PredictCuda(img);
     N = std::min<int>(labels_.size(), N);
-    std::vector<int> maxN = Argmax(output, N);
-    std::vector<Prediction> predictions;
-    for (int i = 0; i < N; ++i)
-    {
-        int idx = maxN[i];
-        predictions.push_back(std::make_pair(labels_[idx], output[idx]));
-    }
-
-    return predictions;
+    std::vector<std::vector<Prediction> > all_predictions;
+    unsigned int j;
+    int i;
+    for ( j = 0; j < outputs.size(); ++j) {
+     std::vector<float> output = outputs[j];
+     N = std::min<int>(labels_.size(), N);
+     std::vector<Prediction> predictions;
+     for ( i = 0; i < N; ++i) {
+       predictions.push_back(std::make_pair(labels_[i], output[i]));
+     }
+     all_predictions.push_back(predictions);
+   }
+   return all_predictions;   
 }
 
-/* Load the mean file in binaryproto format. */
-void Classifier::SetMean(const string& mean_file)
+std::vector<std::vector<float> > Classifier::PredictCuda(const Mat& img)
 {
-    BlobProto blob_proto;
-    ReadProtoFromBinaryFileOrDie(mean_file.c_str(), &blob_proto);
-
-    /* Convert from BlobProto to Blob<float> */
-    Blob<float> mean_blob;
-    mean_blob.FromProto(blob_proto);
-    CHECK_EQ(mean_blob.channels(), num_channels_)
-        << "Number of channels of mean file doesn't match input layer.";
-
-    /* The format of the mean file is planar 32-bit float BGR or grayscale. */
-    std::vector<Mat> channels;
-    float* data = mean_blob.mutable_cpu_data();
-    for (int i = 0; i < num_channels_; ++i)
-    {
-        /* Extract an individual channel. */
-        Mat channel(mean_blob.height(), mean_blob.width(), CV_32FC1, data);
-        channels.push_back(channel);
-        data += mean_blob.height() * mean_blob.width();
+    Mat img_crop;
+    int h = img.rows;
+    int w = img.cols;
+    int tile_w,tile_h;
+    if(w < input_geometry_.width || h < input_geometry_.height)
+    {    
+        cv::resize(img,img_crop,input_geometry_);
+        tile_w = 1;
+        tile_h = 1;
     }
-
-    /* Merge the separate channels into a single image. */
-    Mat packed_mean;
-    merge(channels, packed_mean);
-
-    /* Compute the global mean pixel value and create a mean image
-     * filled with this value. */
-    Scalar channel_mean = mean(packed_mean);
-    Mat host_mean = Mat(input_geometry_, packed_mean.type(), channel_mean);
-    mean_.upload(host_mean);
-}
-
-std::vector<float> Classifier::Predict(const Mat& img)
-{
+    else
+    {
+        int num_tile_w = cvFloor((double)w/input_geometry_.width);
+        tile_w = (num_tile_w > 8) ? 8 : num_tile_w;
+        int num_tile_h = cvFloor((double)h/input_geometry_.height);
+        tile_h = (num_tile_h > 4) ? 4 : num_tile_h;
+        img(Rect(0, 0, input_geometry_.width*tile_w,input_geometry_.height*tile_h)).copyTo(img_crop);
+    }
+        
     Blob<float>* input_layer = net_->input_blobs()[0];
-    input_layer->Reshape(1, num_channels_,
+    input_layer->Reshape(tile_w*tile_h, num_channels_,
                          input_geometry_.height, input_geometry_.width);
-    /* Forward dimension change to all layers. */
+    // Forward dimension change to all layers.
     net_->Reshape();
 
-    std::vector<GpuMat> input_channels;
-    WrapInputLayer(&input_channels);
-
-    Preprocess(img, &input_channels);
-
+    cudaStream_t stream;
+    stream = CUDAStream();
+    Cudacvt(input_layer->mutable_gpu_data(),img_crop.data,input_geometry_.width,input_geometry_.height,tile_w,tile_h,0,stream);
+    
     net_->Forward();
-
     /* Copy the output layer to a std::vector */
+    std::vector<std::vector<float> > outputs;
     Blob<float>* output_layer = net_->output_blobs()[0];
-    const float* begin = output_layer->cpu_data();
-    const float* end = begin + output_layer->channels();
-    return std::vector<float>(begin, end);
-}
-
-/* Wrap the input layer of the network in separate GpuMat objects
- * (one per channel). This way we save one memcpy operation and we
- * don't need to rely on cudaMemcpy2D. The last preprocessing
- * operation will write the separate channels directly to the input
- * layer. */
-void Classifier::WrapInputLayer(std::vector<GpuMat>* input_channels)
-{
-    Blob<float>* input_layer = net_->input_blobs()[0];
-
-    int width = input_layer->width();
-    int height = input_layer->height();
-    float* input_data = input_layer->mutable_gpu_data();
-    for (int i = 0; i < input_layer->channels(); ++i)
-    {
-        GpuMat channel(height, width, CV_32FC1, input_data);
-        input_channels->push_back(channel);
-        input_data += width * height;
+    int j;
+    for (j = 0; j < output_layer->num(); ++j) {
+       const float* begin = output_layer->cpu_data() + j * output_layer->channels();
+       const float* end = begin + output_layer->channels();
+       /* Copy the output layer to a std::vector */
+       outputs.push_back(std::vector<float>(begin, end));
     }
+    return outputs;
 }
 
-void Classifier::Preprocess(const Mat& host_img,
-                            std::vector<GpuMat>* input_channels)
+void Classifier::WarmUp( )
 {
-    GpuMat img(host_img, allocator_);
-    /* Convert the input image to the input image format of the network. */
-    GpuMat sample(allocator_);
-    if (img.channels() == 3 && num_channels_ == 1)
-        cuda::cvtColor(img, sample, CV_BGR2GRAY);
-    else if (img.channels() == 4 && num_channels_ == 1)
-        cuda::cvtColor(img, sample, CV_BGRA2GRAY);
-    else if (img.channels() == 4 && num_channels_ == 3)
-        cuda::cvtColor(img, sample, CV_BGRA2BGR);
-    else if (img.channels() == 1 && num_channels_ == 3)
-        cuda::cvtColor(img, sample, CV_GRAY2BGR);
-    else
-        sample = img;
-
-    GpuMat sample_resized(allocator_);
-    if (sample.size() != input_geometry_)
-        cuda::resize(sample, sample_resized, input_geometry_);
-    else
-        sample_resized = sample;
-
-    GpuMat sample_float(allocator_);
-    if (num_channels_ == 3)
-        sample_resized.convertTo(sample_float, CV_32FC3);
-    else
-        sample_resized.convertTo(sample_float, CV_32FC1);
-
-    GpuMat sample_normalized(allocator_);
-    cuda::subtract(sample_float, mean_, sample_normalized);
-
-    /* This operation will write the separate BGR planes directly to the
-     * input layer of the network because it is wrapped by the GpuMat
-     * objects in input_channels. */
-    cuda::split(sample_normalized, *input_channels);
-
-    CHECK(reinterpret_cast<float*>(input_channels->at(0).data)
-          == net_->input_blobs()[0]->gpu_data())
-        << "Input channels are not wrapping the input layer of the network.";
+  Mat img(input_geometry_.height * 4,input_geometry_.width * 8,CV_8UC3,Scalar(0,0,0));
+  std::vector<std::vector<float> > outputs = PredictCuda(img);
 }
 
 /* By using Go as the HTTP server, we have potentially more CPU threads than
@@ -270,8 +196,8 @@ public:
         return true;
     }
 
-    ExecContext(const string& model_file,
-                 const string& trained_file,
+    ExecContext(const char* model_file,
+                const char* trained_file,
                  const string& mean_file,
                  const string& label_file,
                  int device)
@@ -280,13 +206,10 @@ public:
         cudaError_t st = cudaSetDevice(device_);
         if (st != cudaSuccess)
             throw std::invalid_argument("could not set CUDA device");
-
-        allocator_.reset(new GPUAllocator(1024 * 1024 * 128));
         caffe_context_.reset(new Caffe);
         Caffe::Set(caffe_context_.get());
         classifier_.reset(new Classifier(model_file, trained_file,
-                                         mean_file, label_file,
-                                         allocator_.get()));
+                                         mean_file, label_file));
         Caffe::Set(nullptr);
     }
 
@@ -301,7 +224,7 @@ private:
         cudaError_t st = cudaSetDevice(device_);
         if (st != cudaSuccess)
             throw std::invalid_argument("could not set CUDA device");
-        allocator_->reset();
+  //      allocator_->reset();
         Caffe::Set(caffe_context_.get());
     }
 
@@ -312,7 +235,6 @@ private:
 
 private:
     int device_;
-    std::unique_ptr<GPUAllocator> allocator_;
     std::unique_ptr<Caffe> caffe_context_;
     std::unique_ptr<Classifier> classifier_;
 };
@@ -322,48 +244,90 @@ struct classifier_ctx
     ContextPool<ExecContext> pool;
 };
 
-/* Currently, 2 execution contexts are created per GPU. In other words, 2
+struct classifier_ctxlist
+{
+    classifier_ctx **ctxs;
+    int size;
+};
+
+/* Currently, 1 execution contexts are created per GPU. In other words, 2
  * inference tasks can execute in parallel on the same GPU. This helps improve
  * GPU utilization since some kernel operations of inference will not fully use
  * the GPU. */
-constexpr static int kContextsPerDevice = 2;
+constexpr static int kContextsPerDevice = 1;
 
-classifier_ctx* classifier_initialize(char* model_file, char* trained_file,
+classifier_ctxlist* classifier_initialize(char* model_file, char* trained_file,
                                       char* mean_file, char* label_file)
 {
     try
     {
         ::google::InitGoogleLogging("inference_server");
-
+        ::google::SetLogDestination(google::INFO,"");
+        ::google::SetLogDestination(google::WARNING,"");
+        ::google::SetLogDestination(google::ERROR,"");
         int device_count;
         cudaError_t st = cudaGetDeviceCount(&device_count);
         if (st != cudaSuccess)
             throw std::invalid_argument("could not list CUDA devices");
+  
+        std::vector<std::string> model_files;
+        std::vector<std::string> trained_files;
 
-        ContextPool<ExecContext> pool;
-        for (int dev = 0; dev < device_count; ++dev)
-        {
-            if (!ExecContext::IsCompatible(dev))
-            {
-                LOG(ERROR) << "Skipping device: " << dev;
-                continue;
-            }
-
-            for (int i = 0; i < kContextsPerDevice; ++i)
-            {
-                std::unique_ptr<ExecContext> context(new ExecContext(model_file, trained_file,
-                                                                       mean_file, label_file, dev));
-                pool.Push(std::move(context));
-            }
+        std::ifstream infile;
+        infile.open(model_file);
+        if(!infile.is_open())
+            throw std::invalid_argument("could not open prototxt file");
+        std::string s;
+        while(getline(infile,s)){
+            model_files.push_back(s);
         }
+        infile.close();
+        
+        infile.open(trained_file);
+        if(!infile.is_open())
+            throw std::invalid_argument("could not open caffemodel file");
+        while(getline(infile,s)){
+            trained_files.push_back(s);
+        }
+        infile.close();
+        
+        if (model_files.size() != trained_files.size()){
+           throw std::invalid_argument("number of prototxts is not equal to caffemodels");
+        } 
+        
+        classifier_ctxlist* ctxlist = new classifier_ctxlist;
+        ctxlist->size = model_files.size();
+        ctxlist->ctxs = new classifier_ctx *[ctxlist->size];
+ 
+        for (unsigned int j = 0; j < model_files.size(); ++j)
+        {   
+            ContextPool<ExecContext> pool;
+            for (int dev = 0; dev < device_count; ++dev)
+            {
+                if (!ExecContext::IsCompatible(dev))
+                {
+                    LOG(ERROR) << "Skipping device: " << dev;
+                    continue;
+                }
 
-        if (pool.Size() == 0)
-            throw std::invalid_argument("no suitable CUDA device");
+                for (int i = 0; i < kContextsPerDevice; ++i)
+                {
+  //                  printf("model %d : %s\n",j,model_files[j].c_str());
+                    std::unique_ptr<ExecContext> context(new ExecContext(model_files[j].c_str(), trained_files[j].c_str(),
+                                                                       mean_file, label_file, dev));
+                    pool.Push(std::move(context));
+                }
+            }
 
-        classifier_ctx* ctx = new classifier_ctx{std::move(pool)};
-        /* Successful CUDA calls can set errno. */
-        errno = 0;
-        return ctx;
+            if (pool.Size() == 0)
+                throw std::invalid_argument("no suitable CUDA device");
+
+            classifier_ctx* ctx = new classifier_ctx{std::move(pool)};
+            ctxlist->ctxs[j] = ctx;
+            /* Successful CUDA calls can set errno. */
+            errno = 0;
+        }
+        return ctxlist;
     }
     catch (const std::invalid_argument& ex)
     {
@@ -373,39 +337,62 @@ classifier_ctx* classifier_initialize(char* model_file, char* trained_file,
     }
 }
 
-const char* classifier_classify(classifier_ctx* ctx,
-                                char* buffer, size_t length)
+const char* classifier_classify(classifier_ctxlist* ctxlist,char* buffer)
 {
     try
     {
-        _InputArray array(buffer, length);
-
-        Mat img = imdecode(array, -1);
+        Mat img = imread(buffer);
         if (img.empty())
             throw std::invalid_argument("could not decode image");
-
-        std::vector<Prediction> predictions;
-        {
-            /* In this scope an execution context is acquired for inference and it
-             * will be automatically released back to the context pool when
-             * exiting this scope. */
-            ScopedContext<ExecContext> context(ctx->pool);
-            auto classifier = context->CaffeClassifier();
-            predictions = classifier->Classify(img);
+        
+        if (!img.isContinuous())
+            img = img.clone();
+        int h = img.rows;
+        int w = img.cols;
+        int size_in = min(w,h);
+        int min = 0;
+        int min_idx,diff;
+        int size[3] = {1080,720,540};
+        for(int s = 0; s < 3; ++s){
+           diff = abs(size_in - size[s]); 
+           if(s == 0 || (s > 0 && diff < min)){
+              min  = diff;
+              min_idx = s;
+           }
         }
-
-        /* Write the top N predictions in JSON format. */
+        classifier_ctx* ctx = ctxlist->ctxs[min_idx];
+        std::vector<std::vector<Prediction> > all_predictions;
+        /* In this scope an execution context is acquired for inference and it
+        * will be automatically released back to the context pool when
+        * exiting this scope. */
+        ScopedContext<ExecContext> context(ctx->pool);
+        auto classifier = context->CaffeClassifier();
+        all_predictions = classifier->Classify(img);
+        
         std::ostringstream os;
+        double scores = 0;
         os << "[";
-        for (size_t i = 0; i < predictions.size(); ++i)
-        {
-            Prediction p = predictions[i];
-            os << "{\"confidence\":" << std::fixed << std::setprecision(4)
-               << p.second << ",";
-            os << "\"label\":" << "\"" << p.first << "\"" << "}";
-            if (i != predictions.size() - 1)
-                os << ",";
+        for (size_t i = 0; i < all_predictions.size(); ++i) {
+            std::vector<Prediction>& predictions = all_predictions[i];
+            double score = 0;
+//            os << "{\"tile" << i << "\":\"";
+            for (size_t j = 0; j < predictions.size(); ++j){
+                 Prediction p = predictions[j];
+//                 os << p.first << "-" << p.second << " ";
+                 if( j == 0 )
+                   score += 0 * p.second;   
+                 if( j == 1 )
+                   score += 0.5 * p.second;   
+                 if( j == 2 )
+                   score += 1.0 * p.second;   
+            }
+  //          os << "\"},\n";
+            if(score > 1)
+               score = 1;
+            scores += score;
         }
+        scores = scores / all_predictions.size();
+        os << "{\"score\":" << std::fixed << std::setprecision(6) << scores << "}";
         os << "]";
 
         errno = 0;
@@ -419,7 +406,10 @@ const char* classifier_classify(classifier_ctx* ctx,
     }
 }
 
-void classifier_destroy(classifier_ctx* ctx)
-{
-    delete ctx;
+void classifier_destroy(classifier_ctxlist* ctxlist)
+{   
+    for(int i = 0; i < ctxlist->size; ++i)
+        delete ctxlist->ctxs[i];
+    ctxlist->size = 0;
+    delete ctxlist;
 }

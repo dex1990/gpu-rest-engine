@@ -6,16 +6,16 @@ extern "C" {
 #endif
 
 #include <stddef.h>
-
 typedef struct classifier_ctx classifier_ctx;
 
-classifier_ctx* classifier_initialize(char* model_file, char* trained_file,
+typedef struct classifier_ctxlist classifier_ctxlist;
+
+classifier_ctxlist* classifier_initialize(char* model_file, char* trained_file,
                                       char* mean_file, char* label_file);
 
-const char* classifier_classify(classifier_ctx* ctx,
-                                char* buffer, size_t length);
+const char* classifier_classify(classifier_ctxlist* ctxlist,char* buffer);
 
-void classifier_destroy(classifier_ctx* ctx);
+void classifier_destroy(classifier_ctxlist* ctxlist);
 
 #ifdef __cplusplus
 }
